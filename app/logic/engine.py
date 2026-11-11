@@ -21,7 +21,13 @@ TICKET_CATEGORIES = (
     "Painting / Repairs",
     "Key Handover",
 )
-DATE_FORMATS = ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y")
+DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%B %d, %Y",
+    "%B %d %Y",
+    "%b %d, %Y",
+    "%b %d %Y",
+)
 
 
 def _move_out_datetime(value: Any) -> datetime:

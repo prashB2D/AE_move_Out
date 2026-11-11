@@ -214,7 +214,11 @@ def run_once(
             parsed["tenantEmail"],
         )
         canonical = {**parsed, **thm_data}
-        if canonical.get("thm_home_id") and canonical.get("parseStatus") == "success":
+        if (
+            canonical.get("thm_home_id")
+            and canonical.get("parseStatus") == "success"
+            and not canonical.get("needsReview")
+        ):
             society = canonical["society"]
             flat = canonical["flat"]
             if property_dedup_check(society, flat):
@@ -426,6 +430,11 @@ def _print_run_configuration(*, fresh: bool) -> None:
         print(
             "[dedup] --fresh: using ephemeral store "
             "(ignoring MOVEOUT_DEDUP_DB and MOVEOUT_PROPERTY_DEDUP_DB)"
+        )
+    if os.environ.get("MOVEOUT_THM_TEST_MATCH", "").strip():
+        print(
+            "[WARNING] MOVEOUT_THM_TEST_MATCH is set — THM will return fixture "
+            "data for matching sender emails. Do not use in production."
         )
 
 

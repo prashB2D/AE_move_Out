@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
@@ -24,7 +25,10 @@ THM_HOME_FIELDS = (
     "tenancyTerms",
     "sharingType",
     "tenants",
+    "tenantObjs",
     "owners",
+    "listing",
+    "project",
 )
 _SECURITY_DEPOSIT_FIELDS = (
     "securityDeposit",
@@ -34,10 +38,13 @@ _SECURITY_DEPOSIT_FIELDS = (
 )
 _OPTIONAL_RESULT_FIELDS = (
     "thm_project_id",
+    "thm_listing_id",
     "ownerEmail",
     "ownerPhone",
     "tenantPhone",
     "associationEmail",
+    "associationName",
+    "associationPhone",
     "thm_category",
     "propertyType",
     "monthlyRent",
@@ -48,6 +55,36 @@ _OPTIONAL_RESULT_FIELDS = (
 
 def _not_found() -> dict[str, Any]:
     return {"thm_home_id": None, "thm_status": "not_found"}
+
+
+def _thm_test_match_fixture() -> tuple[str, dict[str, Any]] | None:
+    raw_fixture = os.environ.get("MOVEOUT_THM_TEST_MATCH")
+    if not raw_fixture:
+        return None
+
+    try:
+        fixture = json.loads(raw_fixture)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "MOVEOUT_THM_TEST_MATCH must contain a JSON object."
+        ) from error
+    if not isinstance(fixture, dict):
+        raise ValueError("MOVEOUT_THM_TEST_MATCH must contain a JSON object.")
+
+    test_sender_email = fixture.get("test_sender_email")
+    if not isinstance(test_sender_email, str) or not test_sender_email.strip():
+        raise ValueError(
+            "MOVEOUT_THM_TEST_MATCH must include a non-empty "
+            "'test_sender_email'."
+        )
+
+    result = {
+        key: value
+        for key, value in fixture.items()
+        if key != "test_sender_email"
+    }
+    result["thm_status"] = "matched"
+    return test_sender_email.strip().casefold(), result
 
 
 def _valid_base_url(value: str) -> str:
@@ -139,7 +176,21 @@ def _find_home(
     flat: str,
     tenant_email: str | None,
 ) -> dict[str, Any] | None:
-    if isinstance(tenant_email, str) and "@" in tenant_email:
+    email_lookup_enabled = (
+        os.environ.get("MOVEOUT_THM_EMAIL_LOOKUP", "true").strip().casefold()
+        in {"1", "true", "yes", "on"}
+    )
+    if not email_lookup_enabled:
+        print(
+            "[thm] email lookup disabled "
+            "(MOVEOUT_THM_EMAIL_LOOKUP=false) — using society+flat only"
+        )
+
+    if (
+        email_lookup_enabled
+        and isinstance(tenant_email, str)
+        and "@" in tenant_email
+    ):
         email_homes, total = _query_homes(
             client,
             token,
@@ -200,11 +251,12 @@ def _map_thm_home(
     client: httpx.Client,
     token: str,
     home_summary: dict[str, Any],
-    property_key: str,
+    society: str,
+    flat: str,
 ) -> dict[str, Any]:
     home_id = _resource_id(home_summary.get("_id") or home_summary.get("home_id"))
     if not home_id:
-        raise ValueError(f"THM home result has no ID for property {property_key}.")
+        raise ValueError(f"THM home result has no ID for property {society} {flat}.")
 
     home_response = _resource(client, f"/api/home/{home_id}", token)
     home = home_response.get("home")
@@ -213,7 +265,8 @@ def _map_thm_home(
 
     result: dict[str, Any] = {
         "thm_home_id": home_id,
-        "thm_status": "matched",
+        "society": society,
+        "flat": flat,
     }
 
     terms = home.get("tenancyTerms")
@@ -225,25 +278,6 @@ def _map_thm_home(
         )
         expiry = terms.get("contractPeriodEndDate")
         result["leaseExpiry"] = str(expiry)[:10] if expiry else None
-
-    category_id = _resource_id(home.get("sharingType") or home_summary.get("sharingType"))
-    if category_id:
-        category_response = _resource(client, f"/api/category/{category_id}", token)
-        category = category_response.get("category")
-        if isinstance(category, dict):
-            category_name = category.get("name")
-        else:
-            category_name = category_response.get("name")
-        result["thm_category"] = category_name
-        result["propertyType"] = (
-            "NonPM"
-            if isinstance(category_name, str) and re.search(r"non\s*pm", category_name, re.I)
-            else "PM" if isinstance(category_name, str) and category_name.casefold() == "pm"
-            else None
-        )
-    else:
-        result["thm_category"] = None
-        result["propertyType"] = None
 
     owners = home.get("owners") or home_summary.get("owners") or []
     if owners:
@@ -257,80 +291,120 @@ def _map_thm_home(
             result["ownerEmail"] = owner.get("email")
             result["ownerPhone"] = owner.get("phoneNumber")
 
-    tenants = home.get("tenants") or home_summary.get("tenants") or []
-    if tenants:
-        tenant_id = _resource_id(tenants[0])
-        if isinstance(tenants[0], dict) and tenants[0].get("email"):
-            tenant = tenants[0]
-        elif tenant_id:
+    tenant_objects = home.get("tenantObjs") or home_summary.get("tenantObjs") or []
+    tenant = next(
+        (
+            value
+            for value in tenant_objects
+            if isinstance(value, dict)
+            and any(
+                value.get(field)
+                for field in ("email", "fullName", "firstName", "lastName")
+            )
+        ),
+        None,
+    )
+    if tenant is None:
+        tenants = home.get("tenants") or home_summary.get("tenants") or []
+        for tenant_value in tenants:
+            tenant_id = _resource_id(tenant_value)
+            if not tenant_id:
+                continue
             tenant_response = _resource(
                 client,
-                f"/api/user-tenant/{tenant_id}",
+                f"/api/user/{tenant_id}",
                 token,
             )
             tenant = _user_data(tenant_response, "user", "tenant")
+            if any(
+                tenant.get(field)
+                for field in ("email", "fullName", "firstName", "lastName")
+            ):
+                break
         else:
             tenant = {}
+
+    if tenant:
         result["tenantName"] = tenant.get("fullName") or " ".join(
             filter(None, (tenant.get("firstName"), tenant.get("lastName")))
         )
         result["tenantEmail"] = tenant.get("email")
         result["tenantPhone"] = tenant.get("phoneNumber")
 
-    listing_id: str | None = None
-    listing_id = _resource_id(home.get("listing"))
+    listing_value = home.get("listing") or home_summary.get("listing")
+    listing_id = _resource_id(listing_value)
     if listing_id:
+        result["thm_listing_id"] = listing_id
         listing_response = _resource(client, f"/api/listing/{listing_id}", token)
         listing = listing_response.get("listing", listing_response)
-        if isinstance(listing, dict):
-            project_id = _resource_id(listing.get("project"))
-            if project_id:
-                result["thm_project_id"] = project_id
-                project_response = _resource(
-                    client,
-                    f"/api/project/{project_id}",
-                    token,
+    else:
+        listing = {}
+
+    project_value = home.get("project") or home_summary.get("project")
+    project_id = _resource_id(project_value)
+    if not project_id and isinstance(listing, dict):
+        project_id = _resource_id(listing.get("project"))
+    if project_id:
+        result["thm_project_id"] = project_id
+        project_response = _resource(
+            client,
+            f"/api/project/{project_id}",
+            token,
+        )
+        project = project_response.get("project", project_response)
+        custom_fields = project.get("customFields", [])
+        if isinstance(custom_fields, list):
+            email_values = []
+            for field in custom_fields:
+                if not isinstance(field, dict) or not re.search(
+                    r"e-?mail",
+                    str(field.get("fieldLabel") or ""),
+                    re.I,
+                ):
+                    continue
+                raw_emails = field.get("fieldValue") or field.get("feildValue") or ""
+                email_values.extend(
+                    re.findall(r"[\w.+-]+@[\w.-]+\.\w+", str(raw_emails))
                 )
-                project = project_response.get("project", project_response)
-                custom_fields = project.get("customFields", [])
-                if isinstance(custom_fields, list):
-                    email_field = next(
-                        (
-                            field
-                            for field in custom_fields
-                            if isinstance(field, dict)
-                            and re.search(
-                                r"e-?mail",
-                                str(field.get("fieldLabel") or ""),
-                                re.I,
-                            )
-                        ),
-                        {},
-                    )
-                    raw_emails = str(
-                        email_field.get("fieldValue")
-                        or email_field.get("feildValue")
-                        or ""
-                    )
-                    result["associationEmail"] = "; ".join(
-                        re.findall(r"[\w.+-]+@[\w.-]+\.\w+", raw_emails)
-                    )
-                    company_info = project.get("companyInfo")
-                    if isinstance(company_info, dict):
-                        result["associationName"] = company_info.get("companyName")
-                        country_code = company_info.get("companyCountryCode") or ""
-                        phone_number = company_info.get("companyPhoneNumber") or ""
-                        result["associationPhone"] = (
-                            f"{country_code} {phone_number}".strip()
-                            if phone_number
-                            else None
-                        )
+            result["associationEmail"] = "; ".join(dict.fromkeys(email_values))
+
+        company_info = project.get("companyInfo")
+        if isinstance(company_info, dict):
+            result["associationName"] = company_info.get("companyName") or ""
+            country_code = str(company_info.get("companyCountryCode") or "").strip()
+            phone_number = str(company_info.get("companyPhoneNumber") or "").strip()
+            result["associationPhone"] = (
+                f"{country_code} {phone_number}".strip() if phone_number else ""
+            )
+
+    sharing_type = home.get("sharingType") or home_summary.get("sharingType")
+    category_id = _resource_id(sharing_type)
+    if category_id:
+        category_response = _resource(client, f"/api/category/{category_id}", token)
+        category = category_response.get("category", category_response)
+        category_name = category.get("name")
+    else:
+        category_name = None
+    result["thm_category"] = category_name
+    result["propertyType"] = (
+        "NonPM"
+        if isinstance(category_name, str) and re.search(r"non\s*pm", category_name, re.I)
+        else "PM"
+        if isinstance(category_name, str) and category_name.casefold() == "pm"
+        else None
+    )
+
+    display = _home_name(home) or f"{society} {flat}"
+    category_label = category_name or "category?"
+    result["thm_status"] = (
+        f"Matched THM home {display} ({category_label})."
+    )
 
     for field in _OPTIONAL_RESULT_FIELDS:
         if result.get(field) is None:
             print(
                 f"[thm] WARNING: null field '{field}' for property "
-                f"{property_key} — downstream may be incomplete"
+                f"{society} {flat} — downstream may be incomplete"
             )
     return result
 
@@ -341,6 +415,20 @@ def thm_lookup(
     tenant_email: str | None = None,
 ) -> dict[str, Any]:
     """Log in to THM, find the property, and fetch its related details."""
+    test_match = _thm_test_match_fixture()
+    if (
+        test_match is not None
+        and isinstance(tenant_email, str)
+        and tenant_email.strip().casefold() == test_match[0]
+    ):
+        fixture = test_match[1]
+        print(
+            "[thm] test-mode match: "
+            f"{tenant_email.strip()} -> "
+            f"{fixture.get('thm_home_id', '<missing-home-id>')}"
+        )
+        return fixture
+
     if not isinstance(society, str) or not society.strip():
         return _not_found()
     if not isinstance(flat, str) or not flat.strip():
@@ -385,7 +473,8 @@ def thm_lookup(
             client,
             token,
             match,
-            f"{society.strip()} {flat.strip()}",
+            society.strip(),
+            flat.strip(),
         )
 
 

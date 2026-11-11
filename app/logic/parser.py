@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from datetime import date, datetime
 from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -17,7 +18,7 @@ GEMINI_TIMEOUT_SECONDS = 15
 logger = logging.getLogger(__name__)
 
 PROPERTY_PATTERN = re.compile(
-    r"\bflat\s*(?P<flat>\d+[a-z]?)\s*"
+    r"\bflat\s*(?P<flat>[a-z]?\s*-?\s*\d+[a-z]?)\s*"
     r"(?:(?:at|in)\s+|,\s*)"
     r"(?P<society>[a-z][a-z0-9&'’ -]*?)"
     r"(?=\s*[.,;:!?]|\s+\b(?:my|our|the|lease|agreement|ends?|move[\s-]?out|"
@@ -25,13 +26,18 @@ PROPERTY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-DATE_PATTERN = re.compile(
-    r"\b(?:(?:ends?|ending|expires?)\s+on|(?:vacate|move[\s-]?out)\s+by|on)\s+"
-    r"(?P<date>[a-z]+\s+\d{1,2},?\s+\d{4})\b",
-    re.IGNORECASE,
+_MONTH_PATTERN = (
+    r"(?:January|February|March|April|May|June|July|August|September|"
+    r"October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|"
+    r"Oct|Nov|Dec)"
 )
-ANY_DATE_PATTERN = re.compile(
-    r"\b(?P<date>[a-z]+\s+\d{1,2},?\s+\d{4})\b",
+DATE_CANDIDATE_PATTERN = re.compile(
+    rf"(?<!\w)(?:"
+    rf"\d{{4}}[-/]\d{{1,2}}[-/]\d{{1,2}}"
+    rf"|\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{4}}"
+    rf"|{_MONTH_PATTERN}\s+\d{{1,2}}(?:st|nd|rd|th)?[,]?\s+\d{{4}}"
+    rf"|\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH_PATTERN}[,]?\s+\d{{4}}"
+    rf")(?!\w)",
     re.IGNORECASE,
 )
 
@@ -45,14 +51,45 @@ def _extract_property(text: str) -> tuple[str | None, str | None]:
     if not match:
         return None, None
 
-    flat = match.group("flat").strip()
+    flat = re.sub(r"\s+", "", match.group("flat").strip())
     society = match.group("society").strip().title()
     return flat or None, society or None
 
 
-def _extract_move_out_date(text: str) -> str | None:
-    match = DATE_PATTERN.search(text) or ANY_DATE_PATTERN.search(text)
-    return match.group("date").strip() if match else None
+def _parse_date(value: str) -> date | None:
+    normalized = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", value.strip(), flags=re.I)
+    normalized = re.sub(r"\bSept\b", "Sep", normalized, flags=re.I)
+    normalized = normalized.replace(",", "").replace(".", "")
+    formats = (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%B %d %Y",
+        "%b %d %Y",
+        "%d %B %Y",
+        "%d %b %Y",
+    )
+    for date_format in formats:
+        try:
+            return datetime.strptime(normalized, date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_date(text: str) -> date | None:
+    for match in DATE_CANDIDATE_PATTERN.finditer(text):
+        parsed = _parse_date(match.group(0))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_received_date(value: Any) -> date | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return _extract_date(value.strip())
 
 
 class GeminiClassificationError(RuntimeError):
@@ -179,7 +216,8 @@ def parse_move_out_email(email: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     regex_flat, regex_society = _extract_property(full_text)
-    regex_date = _extract_move_out_date(full_text)
+    body_date = _extract_date(preview)
+    subject_date = _extract_date(subject)
     ai_flat = ai_data.get("flat") if ai_data is not None else None
     ai_society = ai_data.get("society") if ai_data is not None else None
     ai_move_out_date = (
@@ -187,11 +225,53 @@ def parse_move_out_email(email: dict[str, Any]) -> dict[str, Any] | None:
     )
     flat = ai_flat or regex_flat
     society = ai_society or regex_society
-    move_out_date = ai_move_out_date or regex_date
+    extracted_date = body_date or subject_date
+    if extracted_date is None and isinstance(ai_move_out_date, str):
+        extracted_date = _parse_date(ai_move_out_date)
+
+    received_date = _parse_received_date(email.get("receivedDateTime"))
+    if body_date is not None:
+        move_out_date_source = "body"
+    elif subject_date is not None:
+        move_out_date_source = "subject"
+    elif extracted_date is not None:
+        move_out_date_source = "body" if preview else "subject"
+    elif received_date is not None:
+        extracted_date = received_date
+        move_out_date_source = "received_date"
+    else:
+        move_out_date_source = "null"
+
+    move_out_date = extracted_date.isoformat() if extracted_date else None
+    earlier_than_received = bool(
+        extracted_date is not None
+        and received_date is not None
+        and extracted_date < received_date
+    )
+    move_out_date_vague = (
+        move_out_date_source in {"received_date", "null"} or earlier_than_received
+    )
+    needs_review = earlier_than_received or move_out_date_source == "null"
+    review_reason = None
+    if move_out_date_source == "received_date":
+        review_reason = (
+            "No move-out date was found in the email body or subject; "
+            "using the received date as a placeholder."
+        )
+    elif move_out_date_source == "null":
+        review_reason = (
+            "No move-out date or parseable received date was available."
+        )
+    elif earlier_than_received:
+        review_reason = (
+            f"moveOutDate ({move_out_date}) is before email received date "
+            f"({received_date.isoformat()}) — possible invalid notice"
+        )
+
     if ai_data is not None and (
         (not ai_flat and regex_flat)
         or (not ai_society and regex_society)
-        or (not ai_move_out_date and regex_date)
+        or (not ai_move_out_date and (body_date or subject_date))
     ):
         parse_method = "gemini+regex"
     if ai_data is not None and ai_data.get("tenantName"):
@@ -203,6 +283,10 @@ def parse_move_out_email(email: dict[str, Any]) -> dict[str, Any] | None:
         "society": society,
         "flat": flat,
         "moveOutDate": move_out_date,
+        "moveOutDateSource": move_out_date_source,
+        "moveOutDateVague": move_out_date_vague,
+        "needsReview": needs_review,
+        "reviewReason": review_reason,
         "tenantName": tenant_name if isinstance(tenant_name, str) else None,
         "tenantEmail": tenant_email if isinstance(tenant_email, str) else None,
         "parseStatus": "success" if complete else "missing_data",

@@ -57,12 +57,29 @@ _ROW_SNAPSHOT_SCRIPT = r"""row => {
 
     let sender = null;
     let senderAddress = null;
-    for (const span of row.querySelectorAll('span[title]')) {
-        const title = span.getAttribute('title') || '';
-        if (title.includes('@')) {
-            senderAddress = title;
-            sender = (span.innerText || '').trim();
-            break;
+    const senderCandidates = [
+        ...row.querySelectorAll('[role="gridcell"] span[title*="@"]'),
+        ...row.querySelectorAll('[class*="sender" i] span[title*="@"]'),
+        ...row.querySelectorAll('[class*="from" i] span[title*="@"]'),
+    ];
+    const senderElement = [
+        ...new Set([
+            ...senderCandidates,
+            ...row.querySelectorAll('span[title*="@"]'),
+        ]),
+    ].find(element => element.getClientRects().length > 0);
+
+    if (senderElement) {
+        const title = senderElement.getAttribute('title') || '';
+        const addressMatch = title.match(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/);
+        const address = addressMatch ? addressMatch[0] : null;
+        if (address && !/^outlook_[A-Z0-9]+@outlook\.com$/i.test(address)) {
+            senderAddress = address;
+        }
+        sender = (senderElement.innerText || '').trim();
+        if (!sender && addressMatch) {
+            sender = title.replace(addressMatch[0], '').trim();
+            sender = sender.replace(/^[<("' ]+|[>,)"' ]+$/g, '').trim() || null;
         }
     }
 
@@ -141,7 +158,17 @@ def _parse_message_snapshot(
     row_id = snapshot.get("rowId")
     con_id = snapshot.get("conId")
     sender_name = snapshot.get("sender")
-    sender_address = snapshot.get("senderAddress")
+    raw_sender_address = snapshot.get("senderAddress")
+    address_match = (
+        EMAIL_PATTERN.search(raw_sender_address)
+        if isinstance(raw_sender_address, str)
+        else None
+    )
+    sender_address = address_match.group(0) if address_match else None
+    if sender_address and re.fullmatch(
+        r"outlook_[A-Z0-9]+@outlook\.com", sender_address, re.IGNORECASE
+    ):
+        sender_address = None
     sender_record = None
     if sender_name or sender_address:
         email_address: dict[str, str] = {}
