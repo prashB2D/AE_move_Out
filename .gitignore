@@ -1,0 +1,23 @@
+# Environments
+.venv/
+env/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Project & local config
+.env
+*.local
+credentials.json
+token.json
+
+# Browser automation session data / playwright / selenium profiles
+browser_data/
+user_data/
+*.log
+
+# macOS
+.DS_Store
