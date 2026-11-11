@@ -21,3 +21,5 @@ user_data/
 
 # macOS
 .DS_Store
+n8n_context_code.md
+*.docx
