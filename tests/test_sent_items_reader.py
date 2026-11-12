@@ -65,3 +65,56 @@ def test_message_link_uses_selected_folder() -> None:
     assert sent_message["webLink"] == (
         f"https://{outlook_reader.OUTLOOK_HOST}/mail/sentitems/id/conversation-1"
     )
+
+
+def test_message_snapshot_does_not_expose_obfuscated_outlook_sender_address() -> None:
+    message = outlook_reader._parse_message_snapshot(
+        {
+            "sender": "Atharva Singh",
+            "senderAddress": "outlook_93B0F56C19D6711F@outlook.com",
+        }
+    )
+
+    assert message["from"] == {
+        "emailAddress": {"name": "Atharva Singh"}
+    }
+
+
+def test_message_snapshot_keeps_a_real_sender_address() -> None:
+    message = outlook_reader._parse_message_snapshot(
+        {
+            "sender": "Atharva Singh",
+            "senderAddress": "atharva@example.com",
+        }
+    )
+
+    assert message["from"] == {
+        "emailAddress": {
+            "name": "Atharva Singh",
+            "address": "atharva@example.com",
+        }
+    }
+
+
+def test_message_snapshot_maps_sent_item_recipients() -> None:
+    message = outlook_reader._parse_message_snapshot(
+        {
+            "toRecipients": [
+                {"name": "Tenant", "address": "tenant@example.com"},
+                {"name": "", "address": "owner@example.com"},
+                {"name": "Missing address"},
+                "invalid",
+            ]
+        },
+        folder="sentitems",
+    )
+
+    assert message["toRecipients"] == [
+        {
+            "emailAddress": {
+                "name": "Tenant",
+                "address": "tenant@example.com",
+            }
+        },
+        {"emailAddress": {"address": "owner@example.com"}},
+    ]

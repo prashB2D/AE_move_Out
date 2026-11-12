@@ -103,7 +103,20 @@ print(f"Visible sent rows: {len(messages)}")
 ```
 
 Like the Inbox reader, this only returns currently visible rows and exposed
-preview fields; it does not search the complete Sent Items history.
+preview fields; it does not search the complete Sent Items history. Sent Items
+rows include `toRecipients` when Outlook exposes visible recipient elements;
+subject extraction falls back to visible row text when the row's accessible
+label does not contain a recognized subject/time pattern. Recipient and subject
+availability still depends on Outlook's current DOM layout.
+
+The pipeline checks up to 200 visible Sent Items before building a move-out
+pack. A matching acknowledgment subject, property, and tenant/owner recipient
+blocks repeat processing; if the email check does not match, tenant/owner
+names are used as a fallback. `MOVEOUT_SENT_ITEMS_CHECK=true` enables recipient
+matching (the default); setting it to `false` skips recipient matching but
+keeps the name fallback enabled. If Outlook cannot be read, the gate logs the
+failure and allows processing to continue. This check is limited to rows
+exposed in the current Sent Items view and is not a complete mailbox search.
 
 The reader only inspects the visible message-list rows. It never clicks or opens
 a message, so it avoids causing Outlook to mark an unread email as read. It
@@ -117,6 +130,16 @@ authorized account before relying on any field mapping.
 
 The JSON is printed to the terminal and may contain personal information.
 Protect terminal output and do not save or share it without authorization.
+
+Move-out dates are normalized to `YYYY-MM-DD`, preferring a date in the visible
+email preview and then the subject. If neither contains a date, the row's
+`receivedDateTime` is used as a placeholder (`moveOutDateSource` is
+`received_date`, `moveOutDateVague` is true); it is not evidence of the tenant's
+intended move-out date. This placeholder can still produce a dry-run pack. If
+an explicit move-out date predates the received date, the item is flagged with
+`needsReview` and routed to review rather than generating a pack. The full
+message body is not retrieved, so a date omitted from the visible preview may
+not be detected.
 
 ## Deduplication persistence
 
@@ -149,6 +172,38 @@ new audit tables store message subjects/previews, recipients, and dry-run
 payloads; protect database access and backups accordingly. Stop the local
 PostgreSQL service with `make db-down` (the named data volume is retained).
 
+## THM fixture mode for local tests
+
+For a local dry-run only, `MOVEOUT_THM_TEST_MATCH` may contain a JSON object
+with a `test_sender_email` and the THM result fields to use for that sender.
+When the parsed sender email matches (case-insensitively), the pipeline returns
+the fixture without making any THM HTTP requests. Other senders continue through
+the normal THM lookup. Invalid JSON or a missing `test_sender_email` raises an
+error. The run configuration prints a warning whenever this variable is set.
+
+Use only synthetic/test data and keep the JSON in your local `.env` or shell
+environment; do not commit real tenant, owner, or property details. Example
+shape with placeholders:
+
+```sh
+MOVEOUT_THM_TEST_MATCH='{"test_sender_email":"test-sender@example.test","thm_home_id":"test-home","thm_project_id":"test-project","society":"Example Heights","flat":"12","tenantName":"Test Tenant","tenantEmail":"test-recipient@example.test","tenantPhone":null,"ownerName":null,"ownerEmail":null,"ownerPhone":null,"monthlyRent":null,"securityDeposit":null,"leaseExpiry":null,"associationEmail":null,"associationPhone":null,"thm_status":"matched"}'
+```
+
+`MOVEOUT_TEST_EMAIL` redirects planned tenant/owner emails in the dry-run pack
+to a test recipient. The current email adapter only prints a dry-run preview;
+it does not send email. Keep tickets, WhatsApp, and calendar disabled during
+local testing.
+
+## Engine configuration
+
+The Python engine keeps deployment-specific contact, bank, OneDrive, and ticket
+assignment values out of source control. Configure the corresponding
+`MOVEOUT_ENGINE_*` variables in `.env` before using generated content in a live
+workflow. Unconfigured bank fields produce safe placeholder text; do not send
+generated content externally until those fields are configured. Ticket
+assignments may be provided as a JSON object in
+`MOVEOUT_ENGINE_TICKET_AGENT_IDS`.
+
 ## Run the dry-run pipeline from Outlook
 
 Use the same Chrome profile and visible-row reader to pass inbox messages
@@ -159,9 +214,10 @@ directly through the local pipeline:
 ```
 
 The command may prompt you to complete Outlook sign-in and MFA in Chrome. It
-only reads visible inbox rows, then prints a dry-run action preview; it does not
-send email, create THM tickets, WhatsApp messages, or calendar events. The
-pipeline may send move-out subject/preview text to Gemini when
+reads visible inbox rows and, for the Sent Items duplicate gate, visible Sent
+Items rows. It then prints a dry-run action preview; it does not send email,
+create THM tickets, WhatsApp messages, or calendar events. The pipeline may
+send move-out subject/preview text to Gemini when
 `GEMINI_API_KEY` is configured, and queries THM when `THM_PHONE` and
 `THM_PASSWORD` are configured. Set those THM credentials in `.env`; the
 read-only lookup logs in through `/api/login`, searches homes by tenant email
@@ -199,6 +255,62 @@ or downstream actions:
 ```sh
 .venv/bin/python -m app.main --read-only --limit 5
 ```
+
+## Send a pack to the fixed test inbox
+
+Email delivery is available only through the separate, manually invoked
+Playwright mailer. The pipeline and `app.adapters.action_sender` remain
+dry-run-only. The mailer requires `--test-email` and refuses every destination
+except `kingprashu123@gmail.com`; pack recipients and Cc addresses are never
+used as delivery destinations.
+
+First run the pipeline in dry-run mode and save its output locally:
+
+```sh
+MOVEOUT_DRY_RUN=true \
+MOVEOUT_DISABLE_TICKETS=true \
+MOVEOUT_DISABLE_WHATSAPP=true \
+MOVEOUT_DISABLE_CALENDAR=true \
+  .venv/bin/python -m app.main --input-live --limit 20 --fresh \
+  > /tmp/moveout-pipeline.log
+```
+
+The pipeline prints status text before its final JSON summary. Extract the
+first processed pack from that summary:
+
+```sh
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+output = Path("/tmp/moveout-pipeline.log").read_text(encoding="utf-8")
+start = output.rfind("\n{") + 1
+summary = json.loads(output[start:])
+if not summary["auto_processed"]:
+    raise SystemExit("No move-out pack was generated.")
+pack = summary["auto_processed"][0]["pack"]
+Path("/tmp/moveout-pack.json").write_text(
+    json.dumps(pack, indent=2, ensure_ascii=False),
+    encoding="utf-8",
+)
+print(f"Extracted pack: {len(pack['emailsToSend'])} emails")
+PY
+```
+
+Then explicitly send those emails to the fixed test inbox:
+
+```sh
+.venv/bin/python -m app.adapters.playwright_mailer \
+  --pack-file /tmp/moveout-pack.json \
+  --test-email kingprashu123@gmail.com
+```
+
+The mailer opens Chrome using the existing Outlook profile. Complete Outlook
+sign-in and MFA yourself if prompted. It prints a result for each email and
+returns a nonzero exit status if any email fails. Sending is a live action:
+verify the subject and HTML body in the test inbox. The pipeline output and pack
+may contain personal information; keep both files local and delete them when
+they are no longer needed.
 
 For a full pipeline dry-run that ignores prior message/property dedup state,
 uses temporary SQLite stores, and logs one decision per inbox row:

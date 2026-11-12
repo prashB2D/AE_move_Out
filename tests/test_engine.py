@@ -180,3 +180,20 @@ def test_date_format_workdays_month_add_and_safe_config_defaults(
     configured = get_config()
     assert configured["bankAcNo"] == "[bank account number not configured]"
     assert configured["serviceDesk"] == "service@example.test"
+
+
+@pytest.mark.parametrize("move_out", ["November 30, 2026", "2026-11-09"])
+def test_only_owner_notice_and_tenant_ack_are_immediate(
+    canonical_item: dict[str, str], move_out: str
+) -> None:
+    # Also covers a move-out date before the notice date, which used to cap
+    # every send date into the past and mark all emails immediate.
+    canonical_item["moveOutDate"] = move_out
+
+    pack = generate_move_out_pack(canonical_item)
+
+    immediate = {e["step"] for e in pack["emailsToSend"] if e["immediate"]}
+    assert immediate == {"1", "10"}
+    assert len(pack["emailsToSendNow"]) == 2
+    assert len(pack["emailsToSchedule"]) == len(pack["emailsToSend"]) - 2
+    assert all(not e["immediate"] for e in pack["emailsToSchedule"])

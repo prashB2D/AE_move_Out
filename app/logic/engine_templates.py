@@ -957,7 +957,7 @@ EMAIL_META = {
     "Tenant 1st email (acknowledge notice)": {
         "who": "Tenant",
         "send": {
-            "day": 1
+            "day": 0
         },
         "step": "10",
         "mode": "send"
@@ -1013,7 +1013,7 @@ EMAIL_META = {
     "Approval reminder email (owner + tenant)": {
         "who": "Owner and Tenant",
         "send": {
-            "day": 21
+            "day": 7
         },
         "step": "30",
         "mode": "send"

@@ -31,6 +31,10 @@ from app.logic.engine import generate_move_out_pack
 from app.logic.idempotency import check_property_dedup
 from app.logic.parser import parse_move_out_email
 from app.logic.router import thm_lookup as lookup_thm_home
+from app.logic.sent_items_gate import (
+    is_already_handled,
+    read_sent_items_for_gate,
+)
 from app.logic.setup_reply import is_setup_reply, parse_setup_reply
 
 DedupCheck = Callable[[dict[str, Any]], bool]
@@ -39,6 +43,7 @@ PropertyMark = Callable[[str, str], None]
 THMLookup = Callable[[str | None, str | None, str | None], dict[str, Any]]
 MessageRecorder = Callable[[dict[str, Any], str, dict[str, Any] | None], None]
 PackRecorder = Callable[[dict[str, Any], dict[str, Any]], None]
+SentItemsLoader = Callable[[], list[dict[str, Any]]]
 
 
 def _record_message_outcome(
@@ -173,6 +178,8 @@ def run_once(
     property_dedup_check: PropertyDedupCheck = check_property_dedup,
     property_mark: PropertyMark | None = None,
     thm_lookup: THMLookup = lookup_thm_home,
+    sent_items: list[dict[str, Any]] | None = None,
+    sent_items_loader: SentItemsLoader | None = None,
     message_recorder: MessageRecorder = _record_message_outcome,
     pack_recorder: PackRecorder = _record_pack_plan,
 ) -> dict[str, list[Any]]:
@@ -184,6 +191,7 @@ def run_once(
         "sent_to_review": [],
         "ignored_noise": [],
     }
+    cached_sent_items = sent_items
 
     for email in emails:
         message_id = email.get("id")
@@ -221,10 +229,44 @@ def run_once(
         ):
             society = canonical["society"]
             flat = canonical["flat"]
+            category = thm_data.get("thm_category")
+            if not isinstance(category, str) or category.strip().upper() != "PM":
+                print(
+                    f"[gate] {society} {flat} is not PM — skipping"
+                )
+                _log_dedup_decision(email, "ignored_noise")
+                summary["ignored_noise"].append(message_id)
+                message_recorder(email, "ignored_noise", canonical)
+                continue
+
+            if cached_sent_items is None:
+                cached_sent_items = (
+                    sent_items_loader() if sent_items_loader is not None else []
+                )
+            handled, reason = is_already_handled(
+                cached_sent_items,
+                society=thm_data.get("society"),
+                flat=thm_data.get("flat"),
+                tenant_email=thm_data.get("tenantEmail"),
+                owner_email=thm_data.get("ownerEmail"),
+                tenant_name=thm_data.get("tenantName"),
+                owner_name=thm_data.get("ownerName"),
+            )
+            if handled:
+                print(
+                    f"[gate] {thm_data.get('society')} {thm_data.get('flat')} "
+                    f"already handled — {reason}"
+                )
+                summary["dropped_duplicate_or_stale"].append(
+                    canonical.get("graphMessageId", message_id)
+                )
+                message_recorder(email, "dropped_duplicate_or_stale", canonical)
+                continue
+
             if property_dedup_check(society, flat):
                 _log_dedup_decision(email, "dropped_property_duplicate")
                 summary["dropped_duplicate_or_stale"].append(
-                    canonical["graphMessageId"]
+                    canonical.get("graphMessageId", message_id)
                 )
                 message_recorder(
                     email,
@@ -273,6 +315,8 @@ def _run_once_fresh(
     emails: Iterable[dict[str, Any]],
     *,
     thm_lookup: THMLookup = lookup_thm_home,
+    sent_items: list[dict[str, Any]] | None = None,
+    sent_items_loader: SentItemsLoader | None = None,
 ) -> dict[str, list[Any]]:
     with tempfile.TemporaryDirectory(prefix="moveout-fresh-") as directory:
         temp_path = Path(directory)
@@ -301,6 +345,8 @@ def _run_once_fresh(
                 flat,
             ),
             thm_lookup=thm_lookup,
+            sent_items=sent_items,
+            sent_items_loader=sent_items_loader,
             message_recorder=lambda *_args: None,
             pack_recorder=lambda *_args: None,
         )
@@ -529,13 +575,22 @@ async def _run_cli(
     if read_only:
         _print_read_only_rows(emails)
         return {"read_only": emails}
-    summary = (
-        run_thm_lookup_only(emails)
-        if thm_lookup_only
-        else _run_once_fresh(emails, thm_lookup=lookup_thm_home)
-        if fresh_dedup
-        else run_once(emails)
-    )
+
+    if thm_lookup_only:
+        summary = run_thm_lookup_only(emails)
+    elif fresh_dedup:
+        summary = await asyncio.to_thread(
+            _run_once_fresh,
+            emails,
+            thm_lookup=lookup_thm_home,
+            sent_items_loader=lambda: asyncio.run(read_sent_items_for_gate()),
+        )
+    else:
+        summary = await asyncio.to_thread(
+            run_once,
+            emails,
+            sent_items_loader=lambda: asyncio.run(read_sent_items_for_gate()),
+        )
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
     return summary
 

@@ -56,6 +56,9 @@ def test_end_to_end_flow_routes_mock_emails() -> None:
             {
                 "thm_home_id": "THM-HOME-302",
                 "thm_project_id": "THM-PROJ-PP",
+                "society": "Prestige Park",
+                "flat": "302",
+                "thm_category": "PM",
                 "thm_status": "matched",
             }
             if flat == "302"
@@ -96,6 +99,84 @@ def test_end_to_end_flow_drops_duplicate() -> None:
     assert summary["ignored_noise"] == []
 
 
+def test_sent_items_gate_uses_thm_values_after_thm_lookup(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("MOVEOUT_SENT_ITEMS_CHECK", "true")
+    recorded: list[tuple[str, str]] = []
+    sent_item = {
+        "subject": "Acknowledgment of Move-Out Notice - Authoritative Park Unit 77",
+        "bodyPreview": "",
+        "toRecipients": [
+            {"emailAddress": {"address": "thm-tenant@example.com"}},
+        ],
+    }
+
+    def fake_thm_lookup(*_args):
+        print("[thm] lookup completed")
+        return {
+            "thm_home_id": "THM-HOME-302",
+            "society": "Authoritative Park",
+            "flat": "Unit 77",
+            "tenantEmail": "thm-tenant@example.com",
+            "tenantName": "THM Tenant",
+            "thm_category": "PM",
+            "thm_status": "matched",
+        }
+
+    summary = run_once(
+        [FAKE_EMAILS[2]],
+        sent_items_loader=lambda: (
+            print("[gate] Sent Items read") or [sent_item]
+        ),
+        dedup_check=lambda _email: False,
+        property_dedup_check=lambda _society, _flat: False,
+        message_recorder=lambda _email, bucket, _canonical: recorded.append(
+            ("3", bucket)
+        ),
+        pack_recorder=lambda *_args: None,
+        thm_lookup=fake_thm_lookup,
+    )
+
+    assert summary["dropped_duplicate_or_stale"] == ["3"]
+    assert summary["auto_processed"] == []
+    assert recorded == [("3", "dropped_duplicate_or_stale")]
+    output = capsys.readouterr().out
+    assert output.index("[thm] lookup completed") < output.index(
+        "[gate] Sent Items read"
+    )
+    assert output.index("[gate] Sent Items read") < output.index(
+        "[gate] checking"
+    )
+
+
+def test_non_pm_property_is_ignored_before_sent_items_gate(monkeypatch) -> None:
+    from app import main
+
+    monkeypatch.setattr(
+        main,
+        "is_already_handled",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Sent Items gate must not run for non-PM homes")
+        ),
+    )
+    summary = run_once(
+        [FAKE_EMAILS[2]],
+        dedup_check=lambda _email: False,
+        thm_lookup=lambda *_args: {
+            "thm_home_id": "THM-HOME-302",
+            "society": "Prestige Park",
+            "flat": "302",
+            "thm_category": "NonPM",
+        },
+        sent_items_loader=lambda: (_ for _ in ()).throw(
+            AssertionError("Sent Items should not be read for non-PM homes")
+        ),
+        message_recorder=lambda *_args: None,
+    )
+
+    assert summary["ignored_noise"] == ["3"]
+    assert summary["auto_processed"] == []
+
+
 def test_thm_lookup_only_parses_and_fetches_without_building_pack(monkeypatch) -> None:
     from app import main
 
@@ -116,7 +197,10 @@ def test_thm_lookup_only_parses_and_fetches_without_building_pack(monkeypatch) -
         return {
             "thm_home_id": "real-home-id",
             "thm_project_id": "real-project-id",
+            "society": "Example Heights",
+            "flat": "A-12",
             "ownerEmail": "owner@example.com",
+            "thm_category": "PM",
             "thm_status": "matched",
         }
 
@@ -134,7 +218,10 @@ def test_thm_lookup_only_parses_and_fetches_without_building_pack(monkeypatch) -
                 **parsed,
                 "thm_home_id": "real-home-id",
                 "thm_project_id": "real-project-id",
+                "society": "Example Heights",
+                "flat": "A-12",
                 "ownerEmail": "owner@example.com",
+                "thm_category": "PM",
                 "thm_status": "matched",
             }
         ],
@@ -177,6 +264,9 @@ def test_fresh_run_uses_ephemeral_dedup_and_logs_each_decision(monkeypatch, caps
         thm_lookup=lambda *_args: {
             "thm_home_id": "home-real",
             "thm_project_id": "project-real",
+            "society": "Prestige Park",
+            "flat": "302",
+            "thm_category": "PM",
             "thm_status": "matched",
         },
     )
@@ -324,3 +414,83 @@ def test_thm_lookup_only_cli_banner_states_no_actions(
     assert "WhatsApp    : NOT RUN" in output
     assert "Calendar    : NOT RUN" in output
     assert "Dedup writes: NOT RUN" in output
+
+
+def test_run_configuration_warns_when_thm_test_fixture_is_set(monkeypatch, capsys):
+    from app import main
+
+    monkeypatch.setenv("MOVEOUT_THM_TEST_MATCH", '{"test_sender_email":"test@example.com"}')
+
+    main._print_run_configuration(fresh=False)
+
+    assert (
+        "[WARNING] MOVEOUT_THM_TEST_MATCH is set — THM will return fixture data "
+        "for matching sender emails. Do not use in production."
+    ) in capsys.readouterr().out
+
+
+def test_received_date_placeholder_builds_reviewable_dry_run_pack(monkeypatch) -> None:
+    monkeypatch.setenv("MOVEOUT_DISABLE_TICKETS", "true")
+    monkeypatch.setenv("MOVEOUT_DISABLE_WHATSAPP", "true")
+    monkeypatch.setenv("MOVEOUT_DISABLE_CALENDAR", "true")
+    email = {
+        "id": "date-less-notice",
+        "subject": "Move-Out Notice - Flat T-17, Krishna Brookfield",
+        "bodyPreview": (
+            "I am Atharva Singh, moving out of T-17 Krishna Brookfield. "
+            "Thanks, Atharva Singh."
+        ),
+        "receivedDateTime": "Tue 10-11-2026 17:06",
+    }
+
+    summary = run_once(
+        [email],
+        dedup_check=lambda _email: False,
+        property_dedup_check=lambda _society, _flat: False,
+        property_mark=lambda _society, _flat: None,
+        message_recorder=lambda *_args: None,
+        pack_recorder=lambda *_args: None,
+        thm_lookup=lambda *_args: {
+            "thm_home_id": "test-home",
+            "thm_project_id": "test-project",
+            "society": "Krishna Brookfield",
+            "flat": "T-17",
+            "thm_category": "PM",
+            "thm_status": "matched",
+        },
+    )
+
+    assert len(summary["auto_processed"]) == 1
+    canonical = summary["auto_processed"][0]["canonical"]
+    assert canonical["flat"] == "T-17"
+    assert canonical["society"] == "Krishna Brookfield"
+    assert canonical["moveOutDate"] == "2026-11-10"
+    assert canonical["moveOutDateSource"] == "received_date"
+    assert canonical["moveOutDateVague"] is True
+    assert canonical["needsReview"] is False
+    assert summary["auto_processed"][0]["pack"]["reminders"][1][
+        "startISO"
+    ].startswith("2026-11-10")
+
+
+def test_move_out_date_before_received_date_is_sent_to_review(monkeypatch) -> None:
+    email = {
+        "id": "past-move-out-date",
+        "subject": "Move-Out Notice - Flat 302, Prestige Park",
+        "bodyPreview": "I am moving out on Nov 10, 2026.",
+        "receivedDateTime": "2026-11-30",
+    }
+
+    summary = run_once(
+        [email],
+        dedup_check=lambda _email: False,
+        message_recorder=lambda *_args: None,
+        thm_lookup=lambda *_args: {
+            "thm_home_id": "test-home",
+            "thm_status": "matched",
+        },
+    )
+
+    assert not summary["auto_processed"]
+    assert len(summary["sent_to_review"]) == 1
+    assert summary["sent_to_review"][0]["needsReview"] is True

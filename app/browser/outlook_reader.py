@@ -50,36 +50,79 @@ AUTHENTICATION_HOSTS = {
     "login.microsoftonline.com",
 }
 MAX_MID_READ_AUTH_RECOVERIES = 2
-_ROW_SNAPSHOT_SCRIPT = r"""row => {
+_ROW_SNAPSHOT_SCRIPT = r"""(row, folder) => {
     const rowId = row.getAttribute('id') || null;
     const conId = row.getAttribute('data-convid') || null;
     const ariaLabel = row.getAttribute('aria-label') || '';
+    const innerText = row.innerText || '';
 
     let sender = null;
     let senderAddress = null;
-    const senderCandidates = [
-        ...row.querySelectorAll('[role="gridcell"] span[title*="@"]'),
-        ...row.querySelectorAll('[class*="sender" i] span[title*="@"]'),
-        ...row.querySelectorAll('[class*="from" i] span[title*="@"]'),
-    ];
-    const senderElement = [
+    const isSentItems = folder === 'sentitems';
+    const visible = element => element.getClientRects().length > 0;
+    const senderElement = isSentItems ? null : [
         ...new Set([
-            ...senderCandidates,
+            ...row.querySelectorAll('[class*="sender" i] span[title*="@"]'),
+            ...row.querySelectorAll('[class*="from" i] span[title*="@"]'),
+            ...row.querySelectorAll('[role="gridcell"] span[title*="@"]'),
             ...row.querySelectorAll('span[title*="@"]'),
         ]),
-    ].find(element => element.getClientRects().length > 0);
+    ].find(visible);
 
+    const emailPattern = /[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g;
     if (senderElement) {
         const title = senderElement.getAttribute('title') || '';
-        const addressMatch = title.match(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/);
+        const addressMatch = title.match(emailPattern);
         const address = addressMatch ? addressMatch[0] : null;
         if (address && !/^outlook_[A-Z0-9]+@outlook\.com$/i.test(address)) {
             senderAddress = address;
         }
         sender = (senderElement.innerText || '').trim();
-        if (!sender && addressMatch) {
-            sender = title.replace(addressMatch[0], '').trim();
-            sender = sender.replace(/^[<("' ]+|[>,)"' ]+$/g, '').trim() || null;
+        if (!sender) sender = title.replace(emailPattern, '').trim() || null;
+    }
+
+    const toRecipients = [];
+    const seenRecipients = new Set();
+    const recipientCandidates = isSentItems
+        ? [
+            ...row.querySelectorAll('[role="gridcell"] span'),
+            ...row.querySelectorAll('[class*="recipient" i] span'),
+            ...row.querySelectorAll('span[title*="@"]'),
+        ]
+        : [
+            ...row.querySelectorAll('[class*="recipient" i] span[title*="@"]'),
+            ...row.querySelectorAll('[class*="to" i] span[title*="@"]'),
+            ...row.querySelectorAll('[aria-label*="recipient" i] span[title*="@"]'),
+        ];
+    for (const element of new Set(recipientCandidates)) {
+        if (!visible(element)) continue;
+        const text = (element.innerText || '').trim();
+        const searchableText = [
+            element.getAttribute('title') || '',
+            element.getAttribute('aria-label') || '',
+            text,
+        ].join(' ');
+        const addresses = searchableText.match(emailPattern) || [];
+        for (const address of addresses) {
+            const key = address.toLowerCase();
+            if (seenRecipients.has(key)) continue;
+            seenRecipients.add(key);
+            toRecipients.push({
+                name: text.replace(emailPattern, '').trim() || address,
+                address,
+            });
+        }
+    }
+    if (isSentItems) {
+        const sentLabel = ariaLabel.replace(/^Unread\s+/, '').trim();
+        const leadingAddress = sentLabel.match(/^[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/);
+        if (leadingAddress) {
+            const address = leadingAddress[0];
+            const key = address.toLowerCase();
+            if (!seenRecipients.has(key)) {
+                seenRecipients.add(key);
+                toRecipients.push({ name: address, address });
+            }
         }
     }
 
@@ -92,20 +135,28 @@ _ROW_SNAPSHOT_SCRIPT = r"""row => {
         }
     }
 
+    const lines = innerText.split('\n').map(line => line.trim()).filter(Boolean);
     let subject = null;
     let preview = null;
 
-    // PARSE ARIA-LABEL PERFECTLY
     if (ariaLabel) {
         let a = ariaLabel
             .replace(/^Unread\s+/, '')
             .replace(/\s*No conversations selected\s*$/, '')
             .trim();
-            
-        if (sender && a.startsWith(sender)) {
+
+        if (isSentItems) {
+            for (const recipient of toRecipients) {
+                const prefix = recipient.address || recipient.name;
+                if (prefix && a.toLowerCase().startsWith(prefix.toLowerCase())) {
+                    a = a.slice(prefix.length).trim();
+                }
+            }
+            a = a.replace(/^[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\s+/, '');
+        } else if (sender && a.startsWith(sender)) {
             a = a.slice(sender.length).trim();
         }
-        
+
         const m = a.match(/^(.*?)\s+(\d{1,2}:\d{2})\s+(.*)$/);
         if (m) {
             subject = m[1].trim() || null;
@@ -114,7 +165,29 @@ _ROW_SNAPSHOT_SCRIPT = r"""row => {
         }
     }
 
-    return { rowId, conId, sender, senderAddress, subject, received, preview };
+    if (!subject) {
+        const excludedNames = new Set([
+            sender,
+            ...toRecipients.map(recipient => recipient.name),
+        ].filter(Boolean).map(name => name.toLowerCase()));
+        subject = lines.find(line =>
+            !excludedNames.has(line.toLowerCase())
+            && !/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(line)
+            && !/^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}(?:\s|$)/.test(line)
+            && !/^\w{3}\s+\d{1,2}[-/.]/.test(line)
+        ) || null;
+    }
+
+    return {
+        rowId,
+        conId,
+        sender,
+        senderAddress,
+        toRecipients,
+        subject,
+        received,
+        preview,
+    };
 }"""
 
 
@@ -177,6 +250,20 @@ def _parse_message_snapshot(
         if sender_address:
             email_address["address"] = sender_address
         sender_record = {"emailAddress": email_address}
+    to_records = []
+    raw_recipients = snapshot.get("toRecipients")
+    if isinstance(raw_recipients, list):
+        for recipient in raw_recipients:
+            if not isinstance(recipient, dict):
+                continue
+            address = recipient.get("address")
+            if not isinstance(address, str) or not address.strip():
+                continue
+            name = recipient.get("name")
+            email_address = {"address": address.strip()}
+            if isinstance(name, str) and name.strip():
+                email_address["name"] = name.strip()
+            to_records.append({"emailAddress": email_address})
     web_link = (
         f"https://{OUTLOOK_HOST}/mail/{folder}/id/{con_id}" if con_id else None
     )
@@ -187,7 +274,7 @@ def _parse_message_snapshot(
         "subject": snapshot.get("subject"),
         "from": sender_record,
         "receivedDateTime": snapshot.get("received"),
-        "toRecipients": [],
+        "toRecipients": to_records,
         "bodyPreview": snapshot.get("preview"),
         "webLink": web_link,
         "conversationId": con_id,
@@ -383,7 +470,10 @@ async def read_inbox(
                 messages: list[dict[str, Any]] = []
                 count = await rows.count()
                 for index in range(min(count, limit)):
-                    snapshot = await rows.nth(index).evaluate(_ROW_SNAPSHOT_SCRIPT)
+                    snapshot = await rows.nth(index).evaluate(
+                        _ROW_SNAPSHOT_SCRIPT,
+                        folder,
+                    )
                     messages.append(_parse_message_snapshot(snapshot, folder))
 
                 try:

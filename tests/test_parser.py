@@ -34,7 +34,11 @@ def test_parses_move_out_notice_preview() -> None:
         "graphMessageId": "AQAAA6K8tbsBAAAF1bjQOwAAAAA=",
         "society": "Prestige Park",
         "flat": "302",
-        "moveOutDate": "November 30, 2026",
+        "moveOutDate": "2026-11-30",
+        "moveOutDateSource": "body",
+        "moveOutDateVague": False,
+        "needsReview": False,
+        "reviewReason": None,
         "tenantName": "Prashanth Gowda RS",
         "tenantEmail": "outlook_93B0F56C19D6711F@outlook.com",
         "parseStatus": "success",
@@ -70,6 +74,9 @@ def test_returns_missing_data_for_recognized_notice() -> None:
     assert result["flat"] is None
     assert result["society"] is None
     assert result["moveOutDate"] is None
+    assert result["moveOutDateSource"] == "null"
+    assert result["moveOutDateVague"] is True
+    assert result["needsReview"] is True
 
 
 def test_parses_flat_and_society_without_at_preposition() -> None:
@@ -83,7 +90,7 @@ def test_parses_flat_and_society_without_at_preposition() -> None:
     assert result is not None
     assert result["flat"] == "302"
     assert result["society"] == "Prestige Park"
-    assert result["moveOutDate"] == "November 30, 2026"
+    assert result["moveOutDate"] == "2026-11-30"
 
 
 def test_uses_gemini_fields_when_api_key_is_configured(monkeypatch) -> None:
@@ -144,7 +151,7 @@ def test_regex_fills_missing_fields_from_gemini(monkeypatch) -> None:
 
     assert result is not None
     assert result["flat"] == "302"
-    assert result["moveOutDate"] == "November 30, 2026"
+    assert result["moveOutDate"] == "2026-11-30"
     assert result["parseMethod"] == "gemini+regex"
 
 
@@ -206,8 +213,126 @@ def test_gemini_failure_falls_back_to_regex(monkeypatch) -> None:
     assert result is not None
     assert result["society"] == "Prestige Park"
     assert result["flat"] == "302"
-    assert result["moveOutDate"] == "November 30, 2026"
+    assert result["moveOutDate"] == "2026-11-30"
     assert result["parseMethod"] == "regex_fallback"
+
+
+@pytest.mark.parametrize(
+    ("raw_date", "expected"),
+    [
+        ("2026-09-30", "2026-09-30"),
+        ("30/09/2026", "2026-09-30"),
+        ("30-09-2026", "2026-09-30"),
+        ("September 30, 2026", "2026-09-30"),
+        ("30th September, 2026", "2026-09-30"),
+        ("Sept 30 2026", "2026-09-30"),
+    ],
+)
+def test_normalizes_supported_date_formats(raw_date, expected):
+    result = parse_move_out_email(
+        {
+            "subject": "Move-Out Notice - Flat 302, Prestige Park",
+            "bodyPreview": f"I plan to move out on {raw_date}.",
+        }
+    )
+
+    assert result is not None
+    assert result["moveOutDate"] == expected
+    assert result["moveOutDateSource"] == "body"
+
+
+def test_prefers_body_date_over_subject_date():
+    result = parse_move_out_email(
+        {
+            "subject": "Move-Out Notice - Flat 302, Prestige Park on Dec 1, 2026",
+            "bodyPreview": (
+                "Move-out for Flat 302 at Prestige Park is November 30, 2026."
+            ),
+        }
+    )
+
+    assert result is not None
+    assert result["moveOutDate"] == "2026-11-30"
+    assert result["moveOutDateSource"] == "body"
+
+
+def test_uses_subject_date_when_body_has_no_date():
+    result = parse_move_out_email(
+        {
+            "subject": "Move-Out Notice - Flat 302, Prestige Park - Nov 30 2026",
+            "bodyPreview": "I plan to vacate soon.",
+        }
+    )
+
+    assert result is not None
+    assert result["moveOutDate"] == "2026-11-30"
+    assert result["moveOutDateSource"] == "subject"
+    assert result["moveOutDateVague"] is False
+
+
+def test_uses_received_date_as_reviewable_fallback():
+    result = parse_move_out_email(
+        {
+            "subject": "Move-Out Notice - Flat 302, Prestige Park",
+            "bodyPreview": "I plan to move out soon.",
+            "receivedDateTime": "Tue 10-11-2026 17:06",
+        }
+    )
+
+    assert result is not None
+    assert result["moveOutDate"] == "2026-11-10"
+    assert result["moveOutDateSource"] == "received_date"
+    assert result["moveOutDateVague"] is True
+    assert result["needsReview"] is False
+    assert result["parseStatus"] == "success"
+
+
+def test_flags_move_out_date_before_received_date():
+    result = parse_move_out_email(
+        {
+            "subject": "Move-Out Notice - Flat 302, Prestige Park",
+            "bodyPreview": "I am moving out on Nov 10, 2026.",
+            "receivedDateTime": "2026-11-30",
+        }
+    )
+
+    assert result is not None
+    assert result["moveOutDate"] == "2026-11-10"
+    assert result["moveOutDateSource"] == "body"
+    assert result["moveOutDateVague"] is True
+    assert result["needsReview"] is True
+    assert result["reviewReason"] == (
+        "moveOutDate (2026-11-10) is before email received date "
+        "(2026-11-30) — possible invalid notice"
+    )
+
+
+def test_extracts_prefixed_flat_identifier():
+    result = parse_move_out_email(
+        {
+            "subject": "Move-Out Notice - Flat T-17, Krishna Brookfield",
+            "bodyPreview": "I am moving out soon.",
+        }
+    )
+
+    assert result is not None
+    assert result["flat"] == "T-17"
+    assert result["society"] == "Krishna Brookfield"
+
+
+def test_pack_builder_accepts_normalized_iso_move_out_date():
+    from app.logic.engine import generate_move_out_pack
+
+    pack = generate_move_out_pack(
+        {
+            "society": "Prestige Park",
+            "flat": "302",
+            "moveOutDate": "2026-11-30",
+            "thm_home_id": "home-1",
+        }
+    )
+
+    assert pack["reminders"][1]["startISO"].startswith("2026-11-30")
 
 
 def test_gemini_request_uses_api_key_header_and_json_response(monkeypatch) -> None:

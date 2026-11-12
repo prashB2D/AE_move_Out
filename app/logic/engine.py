@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import math
 from datetime import date, timedelta
 from typing import Any
@@ -449,7 +450,10 @@ def _planned_date(
         )
         while not is_working_day(current, config):
             current += timedelta(days=1)
-        return min(current, move_date)
+        # Cap at the move-out date only when it is after the notice. If the
+        # move-out date is before the notice (late notice / bad input), capping
+        # would pull every send date into the past and mark all emails immediate.
+        return min(current, move_date) if move_date >= notice_date else current
     if anchor == "M":
         return workday_add(move_date, offset, config)
     return add_days(move_date, -offset)
@@ -460,6 +464,13 @@ def _build_pack(source: dict[str, Any], config: dict[str, Any]) -> dict[str, Any
     flat = source.get("flat") or ""
     notice_date = parse_date(source.get("noticeDate")) or date.today()
     move_date = _move_date(source.get("moveOutDate"), notice_date, config)
+    if move_date < notice_date:
+        print(
+            f"[engine] WARNING: move-out date {move_date.isoformat()} is before "
+            f"notice date {notice_date.isoformat()}; scheduling emails from "
+            "the notice date. Check the source email.",
+            file=sys.stderr,
+        )
     data, computed, is_non_pm, seepage = _template_data(
         source, config, notice_date, move_date
     )
@@ -583,6 +594,12 @@ def _build_pack(source: dict[str, Any], config: dict[str, Any]) -> dict[str, Any
             )
 
     emails_to_send_now = [email for email in emails_to_send if email["immediate"]]
+    if len(emails_to_send_now) > 2:
+        print(
+            f"[engine] WARNING: {len(emails_to_send_now)} immediate emails; "
+            "expected at most 2 (owner 1st + tenant 1st).",
+            file=sys.stderr,
+        )
     emails_to_schedule = [email for email in emails_to_send if not email["immediate"]]
     whatsapps: list[dict[str, Any]] = []
     for message in WA_SENDS:
