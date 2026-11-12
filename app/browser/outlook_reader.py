@@ -398,6 +398,26 @@ async def _wait_for_inbox_ready(
         await asyncio.sleep(min(0.2, remaining))
 
 
+READING_PANE_BODY = 'div[aria-label="Message body"]'
+
+
+async def _read_full_body(page: Any, row: Any, timeout_ms: int) -> str | None:
+    """Open a row and return the reading-pane body text (newest message first).
+
+    Only used for staff replies to [MO-SETUP] review emails, whose editable
+    details block does not fit in the list preview.
+    """
+    from app.logic.setup_reply import extract_details_block
+
+    await row.click(timeout=timeout_ms)
+    bodies = page.locator(READING_PANE_BODY).filter(visible=True)
+    await bodies.first.wait_for(timeout=timeout_ms)
+    await asyncio.sleep(1.0)
+    texts = [await body.inner_text() for body in await bodies.all()]
+    with_block = [text for text in texts if extract_details_block(text) is not None]
+    return (with_block or texts or [None])[0]
+
+
 async def read_inbox(
     limit: int = 50,
     timeout_ms: int = 15_000,
@@ -475,6 +495,19 @@ async def read_inbox(
                         folder,
                     )
                     messages.append(_parse_message_snapshot(snapshot, folder))
+
+                from app.logic.setup_reply import is_review_reply
+
+                for index, message in enumerate(messages):
+                    if folder != "inbox" or not is_review_reply(message.get("subject")):
+                        continue
+                    try:
+                        text = await _read_full_body(page, rows.nth(index), timeout_ms)
+                    except PlaywrightError as error:
+                        print(f"[reader] Could not open review reply body: {error}")
+                        continue
+                    if text:
+                        message["body"] = {"contentType": "text", "content": text}
 
                 try:
                     await save_auth_state(context, profile_path)

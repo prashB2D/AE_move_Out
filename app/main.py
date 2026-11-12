@@ -203,26 +203,48 @@ def run_once(
             message_recorder(email, "dropped_duplicate_or_stale", None)
             continue
 
+        manual = False
         if is_setup_reply(subject_text):
-            _log_dedup_decision(email, "setup_replies")
-            summary["setup_replies"].append(parse_setup_reply(email))
-            message_recorder(email, "setup_replies", None)
-            continue
-
-        parsed = parse_move_out_email(email)
-        if parsed is None:
-            _log_dedup_decision(email, "ignored_noise")
-            summary["ignored_noise"].append(message_id)
-            message_recorder(email, "ignored_noise", None)
-            continue
+            reply = parse_setup_reply(email)
+            if reply.get("parseStatus") != "success":
+                _log_dedup_decision(email, "setup_replies")
+                summary["setup_replies"].append(reply)
+                message_recorder(email, "setup_replies", None)
+                continue
+            # Staff-corrected details: skip the AI parser, trust the block.
+            print(
+                f"[review-reply] Parsed: {reply['society']} {reply['flat']} "
+                "- proceeding with manualConfirmed=true (AI skipped)"
+            )
+            parsed, manual = reply, True
+        else:
+            parsed = parse_move_out_email(email)
+            if parsed is None:
+                _log_dedup_decision(email, "ignored_noise")
+                summary["ignored_noise"].append(message_id)
+                message_recorder(email, "ignored_noise", None)
+                continue
 
         thm_data = thm_lookup(
             parsed["society"],
             parsed["flat"],
             parsed["tenantEmail"],
         )
-        canonical = {**parsed, **thm_data}
-        if (
+        if manual:
+            # THM fills gaps; values staff typed in the reply win.
+            canonical = {
+                **parsed,
+                **thm_data,
+                **{k: v for k, v in parsed.items() if v not in (None, "")},
+            }
+            if not thm_data.get("thm_home_id"):
+                print(
+                    f"[gate] manualConfirmed=true - proceeding despite THM "
+                    f"not matching {canonical['society']} {canonical['flat']}"
+                )
+        else:
+            canonical = {**parsed, **thm_data}
+        if manual or (
             canonical.get("thm_home_id")
             and canonical.get("parseStatus") == "success"
             and not canonical.get("needsReview")
@@ -230,6 +252,8 @@ def run_once(
             society = canonical["society"]
             flat = canonical["flat"]
             category = thm_data.get("thm_category")
+            if manual:
+                category = canonical.get("propertyType") or category or "PM"
             if not isinstance(category, str) or category.strip().upper() != "PM":
                 print(
                     f"[gate] {society} {flat} is not PM — skipping"
@@ -243,18 +267,19 @@ def run_once(
                 cached_sent_items = (
                     sent_items_loader() if sent_items_loader is not None else []
                 )
+            ident = canonical if manual else thm_data
             handled, reason = is_already_handled(
                 cached_sent_items,
-                society=thm_data.get("society"),
-                flat=thm_data.get("flat"),
-                tenant_email=thm_data.get("tenantEmail"),
-                owner_email=thm_data.get("ownerEmail"),
-                tenant_name=thm_data.get("tenantName"),
-                owner_name=thm_data.get("ownerName"),
+                society=ident.get("society"),
+                flat=ident.get("flat"),
+                tenant_email=ident.get("tenantEmail"),
+                owner_email=ident.get("ownerEmail"),
+                tenant_name=ident.get("tenantName"),
+                owner_name=ident.get("ownerName"),
             )
             if handled:
                 print(
-                    f"[gate] {thm_data.get('society')} {thm_data.get('flat')} "
+                    f"[gate] {ident.get('society')} {ident.get('flat')} "
                     f"already handled — {reason}"
                 )
                 summary["dropped_duplicate_or_stale"].append(
