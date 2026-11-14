@@ -80,7 +80,8 @@ def test_sqlite_store_persists_message_property_and_channel_audit(tmp_path) -> N
 def test_sqlite_store_migrates_existing_dedup_tables(tmp_path) -> None:
     message_db = tmp_path / "messages.sqlite3"
     property_db = tmp_path / "properties.sqlite3"
-    old_seen_at = "2026-11-10T10:00:00+00:00"
+    # Recent timestamp: the property window is 1 day, so a fixed date goes stale.
+    old_seen_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(message_db) as connection:
         connection.execute(
             "CREATE TABLE seen_messages "

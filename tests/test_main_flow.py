@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 
 from app.main import run_once
 
@@ -75,10 +76,10 @@ def test_end_to_end_flow_routes_mock_emails() -> None:
         "mode": "dry_run",
         "tickets_planned": 11,
         "tickets_skipped": 0,
-        "emails_planned": 1,
+        "emails_planned": 3,  # n8n-parity engine: 3 emails have a recipient
         "whatsapp_planned": 0,
         "whatsapp_skipped": 0,
-        "reminders_planned": 2,
+        "reminders_planned": 8,  # n8n-parity engine: 8 reminders
         "reminders_skipped": 0,
     }
     assert len(summary["sent_to_review"]) == 1
@@ -249,7 +250,7 @@ def test_fresh_run_uses_ephemeral_dedup_and_logs_each_decision(monkeypatch, caps
             "Move-out for Flat 302 at Prestige Park. Lease ends on "
             "November 30, 2026."
         ),
-        "receivedDateTime": "2026-11-10T09:49:00+05:30",
+        "receivedDateTime": datetime.now(timezone.utc).isoformat(),  # within 24h
         "from": {
             "emailAddress": {
                 "name": "Tenant",
@@ -468,9 +469,9 @@ def test_received_date_placeholder_builds_reviewable_dry_run_pack(monkeypatch) -
     assert canonical["moveOutDateSource"] == "received_date"
     assert canonical["moveOutDateVague"] is True
     assert canonical["needsReview"] is False
-    assert summary["auto_processed"][0]["pack"]["reminders"][1][
-        "startISO"
-    ].startswith("2026-11-10")
+    move_day = [r for r in summary["auto_processed"][0]["pack"]["reminders"]
+                if "Final joint inspection" in r["subject"]]
+    assert move_day[0]["startISO"].startswith("2026-11-10")
 
 
 def test_move_out_date_before_received_date_is_sent_to_review(monkeypatch) -> None:

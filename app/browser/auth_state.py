@@ -62,8 +62,19 @@ def load_auth_cookies(profile_path: Path) -> list[dict[str, Any]]:
     return cookies
 
 
+_SESSION_URLS = ("https://login.live.com", "https://outlook.live.com")
+
+
 async def restore_auth_cookies(context: BrowserContext, profile_path: Path) -> bool:
-    """Inject saved cookies into a new context; return whether any were restored."""
+    """Inject saved cookies only when the profile has no Microsoft session.
+
+    The persistent Chrome profile keeps (and refreshes) its own cookies.
+    Re-injecting an older auth.json on every launch overwrote those fresher
+    cookies and made outlook.live.com answer HTTP 500, so auth.json is only a
+    fallback for an empty profile.
+    """
+    if await context.cookies(list(_SESSION_URLS)):
+        return False
     cookies = load_auth_cookies(profile_path)
     if not cookies:
         return False

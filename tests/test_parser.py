@@ -332,7 +332,8 @@ def test_pack_builder_accepts_normalized_iso_move_out_date():
         }
     )
 
-    assert pack["reminders"][1]["startISO"].startswith("2026-11-30")
+    move_day = [r for r in pack["reminders"] if "Final joint inspection" in r["subject"]]
+    assert move_day[0]["startISO"].startswith("2026-11-30")
 
 
 def test_gemini_request_uses_api_key_header_and_json_response(monkeypatch) -> None:

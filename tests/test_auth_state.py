@@ -16,6 +16,9 @@ class _FakeContext:
     def __init__(self) -> None:
         self.added_cookies: list[dict] = []
 
+    async def cookies(self, urls=None) -> list[dict]:
+        return []  # empty profile: saved cookies may be restored
+
     async def storage_state(self) -> dict:
         return {
             "cookies": [
@@ -76,3 +79,30 @@ def test_malformed_state_file_fails_explicitly(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="Invalid Outlook cookie state format"):
         load_auth_cookies(profile_path)
+
+
+def test_restore_skips_when_profile_already_signed_in(tmp_path) -> None:
+    import asyncio
+    import json as _json
+
+    from app.browser import auth_state
+
+    (tmp_path / "auth.json").write_text(_json.dumps({"cookies": [{"name": "old"}]}))
+
+    class Context:
+        def __init__(self, existing):
+            self.existing, self.added = existing, []
+
+        async def cookies(self, urls):
+            return self.existing
+
+        async def add_cookies(self, cookies):
+            self.added += cookies
+
+    signed_in = Context([{"name": "fresh"}])
+    assert asyncio.run(auth_state.restore_auth_cookies(signed_in, tmp_path)) is False
+    assert signed_in.added == []  # fresh profile cookies are never overwritten
+
+    empty = Context([])
+    assert asyncio.run(auth_state.restore_auth_cookies(empty, tmp_path)) is True
+    assert empty.added == [{"name": "old"}]

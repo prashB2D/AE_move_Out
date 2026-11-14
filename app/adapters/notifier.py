@@ -21,6 +21,8 @@ class Followup:
     phone: str
     message: str
     email_subject: str
+    name: str = ""
+    property: str = ""
 
 
 class Notifier(Protocol):
@@ -30,6 +32,19 @@ class Notifier(Protocol):
 def _roles(email: dict[str, Any]) -> list[str]:
     role = str(email.get("role") or "").lower()
     return [r for r in ("owner", "tenant") if r in role]
+
+
+def _name_for(role: str, pack: dict[str, Any]) -> str:
+    """Owner/tenant name from the engine's WhatsApp entries (first variable)."""
+    for entry in pack.get("whatsappMessages") or pack.get("whatsapps") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("role") or entry.get("recipientRole") or "").lower() != role:
+            continue
+        variables = entry.get("variables") or []
+        if variables and isinstance(variables[0], str) and variables[0].strip():
+            return variables[0].strip()
+    return ""
 
 
 def build_email_followups(
@@ -50,6 +65,8 @@ def build_email_followups(
                     "process. Please check your inbox."
                 ),
                 email_subject=str(email.get("subject") or ""),
+                name=_name_for(role, pack),
+                property=str(pack.get("propertyRef") or ""),
             )
         )
     return followups

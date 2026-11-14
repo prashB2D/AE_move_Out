@@ -447,7 +447,10 @@ async def send_pack_emails(
     checked_pack = _extract_pack(pack)
     if limit is not None and limit < 1:
         raise ValueError("limit must be a positive integer.")
-    notifier = notifier or LogNotifier()
+    if notifier is None:
+        from app.adapters.whatsapp_sender import notifier_from_env
+
+        notifier = notifier_from_env()
 
     emails, skipped = _select_emails(checked_pack, include_scheduled)
     total = len(checked_pack["emailsToSend"])
